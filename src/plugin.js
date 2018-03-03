@@ -1,6 +1,7 @@
 import webpack, { DllReferencePlugin } from 'webpack';
 import flatMap from 'lodash/flatMap';
 import isEmpty from 'lodash/isEmpty';
+import { SyncHook } from 'tapable';
 import { RawSource } from 'webpack-sources';
 
 import path from 'path';
@@ -68,31 +69,31 @@ class AutoDLLPlugin {
         }).apply(compiler);
       });
 
-    compiler.plugin('before-compile', (params, callback) => {
-      params.compilationDependencies = params.compilationDependencies.filter(
-        path => !path.startsWith(cacheDir)
-      );
+    const beforeCompile = params => {
+      const dependencies = new Set(params.compilationDependencies);
+      [...dependencies].filter(path => !path.startsWith(cacheDir));
+    };
 
-      callback();
-    });
-
-    compiler.plugin(['run', 'watch-run'], (_compiler, callback) => {
+    const watchRun = compiler => {
       compileIfNeeded(() => webpack(dllConfig))
         .then(a => {
           return a;
         })
         .then(handleStats)
         .then(({ source, stats }) => {
-          compiler.applyPlugins('autodll-stats-retrieved', stats, source);
-
+          if (compiler.hooks) {
+            compiler.hooks.autodllStatsRetrieved = new SyncHook(['stats', 'source']);
+            compiler.hooks.autodllStatsRetrieved.call(stats, source);
+          } else {
+            compiler.applyPlugins('autodll-stats-retrieved', stats, source);
+          }
           if (source === 'memory') return;
           return memory.sync(settings.hash, stats);
         })
-        .then(() => callback())
         .catch(console.error);
-    });
+    };
 
-    compiler.plugin('emit', (compilation, callback) => {
+    const emit = compilation => {
       const dllAssets = memory.getAssets().reduce((assets, { filename, buffer }) => {
         const assetPath = path.join(settings.path, filename);
 
@@ -103,9 +104,17 @@ class AutoDLLPlugin {
       }, {});
 
       compilation.assets = { ...compilation.assets, ...dllAssets };
+    };
 
-      callback();
-    });
+    if (compiler.hooks) {
+      compiler.hooks.beforeCompile.tap('AutoDllPlugin', beforeCompile);
+      compiler.hooks.watchRun.tapAsync('AutoDllPlugin', watchRun);
+      compiler.hooks.emit.tap('AutoDllPlugin', emit);
+    } else {
+      compiler.plugin('before-compile', beforeCompile);
+      compiler.plugin(['run', 'watch-run'], watchRun);
+      compiler.plugin('emit', emit);
+    }
 
     if (inject) {
       const getDllEntriesPaths = extension =>
@@ -119,20 +128,25 @@ class AutoDLLPlugin {
             })
           );
 
-      compiler.plugin('compilation', compilation => {
-        compilation.plugin(
-          'html-webpack-plugin-before-html-generation',
-          (htmlPluginData, callback) => {
-            htmlPluginData.assets.js = [...getDllEntriesPaths('.js'), ...htmlPluginData.assets.js];
-            htmlPluginData.assets.css = [
-              ...getDllEntriesPaths('.css'),
-              ...htmlPluginData.assets.css,
-            ];
+      const doCompilation = (htmlPluginData, callback) => {
+        htmlPluginData.assets.js = [...getDllEntriesPaths('.js'), ...htmlPluginData.assets.js];
+        htmlPluginData.assets.css = [...getDllEntriesPaths('.css'), ...htmlPluginData.assets.css];
 
-            callback(null, htmlPluginData);
-          }
-        );
-      });
+        callback(null, htmlPluginData);
+      };
+
+      if (compiler.hooks) {
+        compiler.hooks.compilation.tap('AutoDllPlugin', compilation => {
+          compilation.hooks.htmlWebpackPluginBeforeHtmlGeneration.tap(
+            'AutoDllPlugin',
+            doCompilation
+          );
+        });
+      } else {
+        compiler.plugin('compilation', compilation => {
+          compilation.plugin('html-webpack-plugin-before-html-generation', doCompilation);
+        });
+      }
     }
   }
 }
